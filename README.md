@@ -1,2 +1,2 @@
-# migrant
-Database migration tool for PostgreSQL that is similar to Flyway for Java
+# Migrant
+Small database migration for PostgreSQL similar to Flyway (Java).
