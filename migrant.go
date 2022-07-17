@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	//"errors"
+	//"fmt"
 	"io"
 	"log"
 	"os"
@@ -17,61 +20,147 @@ import (
 
 const debug = false
 
-type Config struct {
-	ConnectionUrl string
-	FileLocation  string
-	TableName     string
-	Files         []File
-}
-
 type File struct {
 	FileName string
 	Checksum string
 }
 
+type fileSystem struct {
+	Files []File
+}
+
+type fileSystemer interface {
+	readDirectory(string) []string
+	createMd5Sum(string) string
+	addToFileList([]File)
+}
+
+type Config struct {
+	FileLocation string
+	Url          string
+	TableName    string
+}
+
+type DbConnection struct {
+	ctx  context.Context
+	conn *pgx.Conn
+	tx   pgx.Tx
+}
+
+type dbconnector interface {
+	connect(string) error
+	close()
+}
+
+type dbtransactor interface {
+	begin() error
+	rollback()
+	exec(string) error
+	commit() error
+}
+
+type dbfuncer interface {
+	query(string, string) (table, error)
+	executeSqlFile(string) error
+	insertIntoDbMigration(string, File) error
+}
+
+type databaser interface {
+	dbconnector
+	dbtransactor
+	dbfuncer
+}
+
+type table struct {
+	versionId int
+	checksum  string
+}
+
 func (conf *Config) Migrate() {
 	log.Println("INFO: Migration started.")
-	ctx := context.Background()
+	var dbconn DbConnection
+	dbconn.ctx = context.Background()
+
 	conf.checkOrSetDefaultConfig()
-	conn, err := pgx.Connect(ctx, conf.ConnectionUrl)
+	var err error
+	err = dbconn.connect(conf.Url)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close(ctx)
+	defer dbconn.close()
 
-	err = conf.getSqlFilesProperties()
+	fs := fileSystem{}
+	err = getSqlFilesProperties(&fs, conf.FileLocation)
 	if err != nil {
 		return
 	}
-	err = conf.createTableIfNotExists(&ctx, conn)
+	err = createTableIfNotExists(&dbconn, conf.TableName)
 	if err != nil {
 		return
 	}
-	conf.compareOrExecuteSql(&ctx, conn)
+	compareOrExecuteSql(&dbconn, conf.FileLocation, conf.TableName, fs.Files)
 	log.Println("INFO: Migration done.")
 }
 
-func (conf *Config) getSqlFilesProperties() error {
-	path := conf.FileLocation
+func (dbconn *DbConnection) connect(url string) error {
+	conn, err := pgx.Connect(dbconn.ctx, url)
+	dbconn.conn = conn
+	return err
+}
+
+func (dbconn *DbConnection) close() {
+	dbconn.conn.Close(dbconn.ctx)
+}
+
+func (dbconn *DbConnection) begin() error {
+	var tx pgx.Tx
+	tx, err := dbconn.conn.Begin(dbconn.ctx)
+	dbconn.tx = tx
+	return err
+}
+
+func (dbconn *DbConnection) rollback() {
+	dbconn.tx.Rollback(dbconn.ctx)
+}
+
+func (dbconn *DbConnection) exec(sql string) error {
+	_, err := dbconn.tx.Exec(dbconn.ctx, sql)
+	return err
+}
+
+func (dbconn *DbConnection) commit() error {
+	err := dbconn.tx.Commit(dbconn.ctx)
+	return err
+}
+
+func (fs *fileSystem) readDirectory(path string) []string {
 	dirEntries, err := os.ReadDir(path)
 	if err != nil {
-		log.Println(err)
-		return err
+		log.Fatalln(err)
 	}
 	var filenames []string
 	for _, f := range dirEntries {
 		filenames = append(filenames, f.Name())
 	}
+	return filenames
+}
+
+func (fs *fileSystem) addToFileList(files []File) {
+	fs.Files = files
+}
+
+func getSqlFilesProperties(fs fileSystemer, path string) error { // Write a test for this
+	filenames := fs.readDirectory(path)
 	sortedFilenames := naturalsort.Sort(filenames)
 	var fcs []File
 	for _, f := range sortedFilenames {
 		fc := File{
 			FileName: f,
-			Checksum: createMd5Sum(filepath.Join(path, f)),
+			Checksum: fs.createMd5Sum(filepath.Join(path, f)),
 		}
 		fcs = append(fcs, fc)
 	}
-	conf.Files = fcs
+	fs.addToFileList(fcs)
 	return nil
 }
 
@@ -84,20 +173,20 @@ func (conf *Config) checkOrSetDefaultConfig() {
 	}
 }
 
-func (conf *Config) createTableIfNotExists(ctx *context.Context, conn *pgx.Conn) error {
-	tx, err := conn.Begin(*ctx)
+func createTableIfNotExists(dbconn databaser, table string) error {
+	err := dbconn.begin()
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	defer tx.Rollback(*ctx)
+	defer dbconn.rollback()
 
 	sql := fmt.Sprintf(`create table if not exists %s (
 	version_id serial primary key,
 	filename varchar not null,
 	checksum varchar not null
-	);`, conf.TableName)
-	_, err = tx.Exec(*ctx, sql)
+	);`, table)
+	err = dbconn.exec(sql)
 	if err != nil {
 		log.Println(err)
 		return err
@@ -106,14 +195,14 @@ func (conf *Config) createTableIfNotExists(ctx *context.Context, conn *pgx.Conn)
 	sql = fmt.Sprintf(`create unique index if not exists %s_filename on %s (
 		filename asc
 	)
-	`, conf.TableName, conf.TableName)
-	_, err = tx.Exec(*ctx, sql)
+	`, table, table)
+	err = dbconn.exec(sql)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
 
-	err = tx.Commit(*ctx)
+	err = dbconn.commit()
 	if err != nil {
 		log.Println(err)
 		return err
@@ -121,22 +210,28 @@ func (conf *Config) createTableIfNotExists(ctx *context.Context, conn *pgx.Conn)
 	return nil
 }
 
-func (conf *Config) compareOrExecuteSql(ctx *context.Context, conn *pgx.Conn) error {
+func (dbconn *DbConnection) query(filename string, tablename string) (table, error) {
+	table := table{}
+	selectStmt := fmt.Sprintf("select version_id, checksum from %s where filename = $1", tablename)
+	err := dbconn.conn.QueryRow(dbconn.ctx, selectStmt, filename).Scan(table.versionId, table.checksum)
+	return table, err
+}
+
+func compareOrExecuteSql(dbconn databaser, path string, tablename string, files []File) error {
 	var (
-		versionId int
-		checksum  string
+		tbl table
+		err error
 	)
-	selectStmt := fmt.Sprintf("select version_id, checksum from %s where filename = $1", conf.TableName)
-	for _, file := range conf.Files {
-		err := conn.QueryRow(*ctx, selectStmt, file.FileName).Scan(&versionId, &checksum)
+	for _, file := range files {
+		tbl, err = dbconn.query(file.FileName, tablename)
 		if err != nil {
 			if err.Error() == "no rows in result set" { // Migration was not executed before
 				// Execute migration
-				if err := conf.executeSqlFile(ctx, conn, file); err != nil {
+				if err := dbconn.executeSqlFile(filepath.Join(path, file.FileName)); err != nil {
 					return err
 				}
 				// Insert checksum into the migration table
-				if err := conf.insertIntoDbMigration(ctx, conn, file); err != nil {
+				if err := dbconn.insertIntoDbMigration(tablename, file); err != nil {
 					return err
 				}
 				log.Printf("INFO: Migration successful: file %s, checksum %s\n", file.FileName, file.Checksum)
@@ -146,34 +241,35 @@ func (conf *Config) compareOrExecuteSql(ctx *context.Context, conn *pgx.Conn) er
 			}
 			continue
 		}
-		if file.Checksum != checksum { // Mismatch in checksums
+		if file.Checksum != tbl.checksum { // Mismatch in checksums
 			err = errors.New("checksums do not match")
-			log.Fatalf("ERROR: Checksum of file %s is %s but is expected to be %s. Error: %s\n",
-				file.FileName, file.Checksum, checksum, err)
+			log.Printf("ERROR: Checksum of file %s is %s but is expected to be %s. Error: %s\n",
+				file.FileName, file.Checksum, tbl.checksum, err)
+			return err
 		}
 		if debug {
-			log.Printf("DEBUG: Skipped existing migration: Version %d, checksum %s\n", versionId, checksum)
+			log.Printf("DEBUG: Skipped existing migration: Version %d, checksum %s\n", tbl.versionId, tbl.checksum)
 		}
 	}
 	return nil
 }
 
-func (conf *Config) insertIntoDbMigration(ctx *context.Context, conn *pgx.Conn, file File) error {
-	tx, err := conn.Begin(*ctx)
+func (dbconn *DbConnection) insertIntoDbMigration(tablename string, file File) error {
+	tx, err := dbconn.conn.Begin(dbconn.ctx)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	defer tx.Rollback(*ctx)
+	defer tx.Rollback(dbconn.ctx)
 
-	stmt := fmt.Sprintf("insert into %s (filename, checksum) values ($1, $2);", conf.TableName)
-	_, err = tx.Exec(*ctx, stmt, file.FileName, file.Checksum)
+	stmt := fmt.Sprintf("insert into %s (filename, checksum) values ($1, $2);", tablename)
+	_, err = tx.Exec(dbconn.ctx, stmt, file.FileName, file.Checksum)
 	if err != nil {
 		log.Fatalf("ERROR: Could not insert DB record into %s. Check if the migration file %s has been executed successfully. Error: %s\n",
-			conf.TableName, file.FileName, err)
+			tablename, file.FileName, err)
 	}
 
-	err = tx.Commit(*ctx)
+	err = tx.Commit(dbconn.ctx)
 	if err != nil {
 		log.Println(err)
 		return err
@@ -181,27 +277,26 @@ func (conf *Config) insertIntoDbMigration(ctx *context.Context, conn *pgx.Conn, 
 	return nil
 }
 
-func (conf *Config) executeSqlFile(ctx *context.Context, conn *pgx.Conn, file File) error {
-	tx, err := conn.Begin(*ctx)
+func (dbconn *DbConnection) executeSqlFile(path string) error {
+	err := dbconn.begin()
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	defer tx.Rollback(*ctx)
+	defer dbconn.rollback()
 
-	pathToFile := filepath.Join(conf.FileLocation, file.FileName)
-	sql, err := os.ReadFile(pathToFile)
+	sql, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("ERROR: Unable to read %s\n", pathToFile)
+		log.Printf("ERROR: Unable to read %s\n", path)
 		return err
 	}
 
-	_, err = tx.Exec(*ctx, string(sql))
+	err = dbconn.exec(string(sql))
 	if err != nil {
-		log.Fatalf("ERROR: Could not execute SQL file %s. Error: %s\n", pathToFile, err)
+		log.Fatalf("ERROR: Could not execute SQL file %s. Error: %s\n", path, err)
 	}
 
-	err = tx.Commit(*ctx)
+	err = dbconn.commit()
 	if err != nil {
 		log.Println(err)
 		return err
@@ -209,7 +304,7 @@ func (conf *Config) executeSqlFile(ctx *context.Context, conn *pgx.Conn, file Fi
 	return nil
 }
 
-func createMd5Sum(filename string) string {
+func (fs *fileSystem) createMd5Sum(filename string) string {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Println(err)
